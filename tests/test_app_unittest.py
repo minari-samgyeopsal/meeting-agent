@@ -7,13 +7,16 @@ from tests.test_support import install_dependency_stubs
 install_dependency_stubs()
 
 from src.app import (
+    _emit_say_response,
     _decorate_recent_entries,
     _help_text,
     _normalize_natural_command,
     _parse_create_command,
     _parse_ops_arguments,
     _resolve_meeting_reference,
+    dispatch_channel_message_event,
     dispatch_text_command,
+    dispatch_message_event,
 )
 from src.utils.meeting_state import resolve_auto_rerun_stage
 from src.utils.ops_formatter import format_dashboard_snapshot, format_doctor_summary, format_recent_meetings
@@ -342,6 +345,57 @@ class AppUnitTest(unittest.TestCase):
                 rendered = run(dispatch_text_command("방금 미팅 상태 보여줘"))
         self.assertIn("📌 카카오 미팅 진행 상태", rendered)
         self.assertIn("• 어젠다 진행률: 3/3", rendered)
+
+    def test_dispatch_message_event_routes_channel_monitor_for_public_channel(self):
+        async def _handle_channel_message(event, client=None):
+            return {"text": "archive proposal", "blocks": [{"type": "actions"}]}
+
+        with patch("src.app.ChannelMonitorAgent") as mock_agent_cls:
+            mock_agent = mock_agent_cls.return_value
+            mock_agent.handle_channel_message.side_effect = _handle_channel_message
+            rendered = run(
+                dispatch_message_event(
+                    {
+                        "channel_type": "channel",
+                        "channel": "C123",
+                        "text": "외부 미팅 정리와 후속 요청입니다.",
+                        "ts": "123.456",
+                    },
+                    client=None,
+                )
+            )
+
+        self.assertEqual(rendered["text"], "archive proposal")
+
+    def test_dispatch_message_event_preserves_dm_flow_when_channel_monitor_returns_none(self):
+        with patch("src.app.ChannelMonitorAgent") as mock_agent_cls:
+            mock_agent = mock_agent_cls.return_value
+            async def _handle_channel_message(event, client=None):
+                return None
+            mock_agent.handle_channel_message.side_effect = _handle_channel_message
+            rendered = run(
+                dispatch_message_event(
+                    {"channel_type": "im", "text": "help", "ts": "1"},
+                    client=None,
+                )
+        )
+        self.assertIn("/meetagain help", rendered)
+
+    def test_emit_say_response_supports_dict_payload(self):
+        captured = {}
+
+        def _say(*args, **kwargs):
+            captured["args"] = args
+            captured["kwargs"] = kwargs
+
+        _emit_say_response(_say, {"text": "hello", "thread_ts": "123.456", "blocks": [{"type": "section"}]})
+        self.assertEqual(captured["args"], ())
+        self.assertEqual(captured["kwargs"]["text"], "hello")
+        self.assertEqual(captured["kwargs"]["thread_ts"], "123.456")
+
+    def test_dispatch_channel_message_event_returns_none_for_dm(self):
+        rendered = run(dispatch_channel_message_event({"channel_type": "im", "text": "안녕하세요", "ts": "1"}))
+        self.assertIsNone(rendered)
 
     def test_dispatch_text_command_before_returns_briefing_summary(self):
         async def _run_daily_briefing():

@@ -20,8 +20,10 @@ from slack_bolt.adapter.socket_mode import SocketModeHandler
 
 from src.agents.after_agent import AfterAgent
 from src.agents.before_agent import BeforeAgent
+from src.agents.channel_monitor_agent import ChannelMonitorAgent
 from src.agents.during_agent import DuringAgent
 from src.cli import _build_dashboard, _build_doctor_report, _build_meeting_bundle, _list_meeting_states
+from src.services.drive_service import DriveService
 from src.utils.config import Config
 from src.utils.logger import get_logger
 from src.utils.meeting_state import resolve_auto_rerun_stage
@@ -35,6 +37,7 @@ from src.utils.status_formatter import format_meeting_status
 logger = get_logger(__name__)
 _RECENT_EVENT_KEYS = deque(maxlen=200)
 _PENDING_TRANSCRIPT_UPLOADS = {}
+_PENDING_AFTER_PIPELINES = {}
 
 
 def _build_app() -> App:
@@ -75,7 +78,7 @@ def _build_app() -> App:
         except Exception:
             logger.exception("App mention handling failed")
             response = "멘션 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
-        say(response)
+        _emit_say_response(say, response)
 
     @app.event("message")
     def handle_message_event(event, say, client):
@@ -85,12 +88,6 @@ def _build_app() -> App:
         if subtype in {"bot_message", "message_changed", "message_deleted"}:
             return
 
-        channel_type = event.get("channel_type")
-        files = event.get("files") or []
-        text = (event.get("text") or "").strip()
-        if channel_type != "im" and not files:
-            return
-
         try:
             response = asyncio.run(dispatch_message_event(event, client))
         except Exception:
@@ -98,7 +95,16 @@ def _build_app() -> App:
             response = "메시지 처리 중 오류가 발생했습니다. 잠시 후 다시 시도해주세요."
 
         if response:
-            say(response)
+            _emit_say_response(say, response)
+
+    @app.event("file_shared")
+    def handle_file_shared_event(event, client):
+        if _is_duplicate_event(event):
+            return
+        try:
+            asyncio.run(_handle_file_shared_event(event, client))
+        except Exception:
+            logger.exception("file_shared handling failed")
 
     @app.action("trello_register")
     def handle_trello_register(ack, body, respond):
@@ -143,6 +149,62 @@ def _build_app() -> App:
                 "response_type": "ephemeral",
             }
         )
+
+    @app.action("archive_register")
+    def handle_archive_register(ack, body, respond, client):
+        try:
+            asyncio.run(ChannelMonitorAgent().handle_archive_action(ack, body, client, respond=respond))
+        except Exception:
+            logger.exception("Archive register action failed")
+            respond(
+                {
+                    "text": "아카이빙 등록 처리 중 오류가 발생했습니다.",
+                    "replace_original": False,
+                    "response_type": "ephemeral",
+                }
+            )
+
+    @app.action("archive_change_card")
+    def handle_archive_change_card(ack, body, respond, client):
+        try:
+            asyncio.run(ChannelMonitorAgent().handle_archive_action(ack, body, client, respond=respond))
+        except Exception:
+            logger.exception("Archive change card action failed")
+            respond(
+                {
+                    "text": "카드 변경 처리 중 오류가 발생했습니다.",
+                    "replace_original": False,
+                    "response_type": "ephemeral",
+                }
+            )
+
+    @app.action("archive_skip")
+    def handle_archive_skip(ack, body, respond, client):
+        try:
+            asyncio.run(ChannelMonitorAgent().handle_archive_action(ack, body, client, respond=respond))
+        except Exception:
+            logger.exception("Archive skip action failed")
+            respond(
+                {
+                    "text": "아카이빙 건너뛰기 처리 중 오류가 발생했습니다.",
+                    "replace_original": False,
+                    "response_type": "ephemeral",
+                }
+            )
+
+    @app.action("archive_select_card")
+    def handle_archive_select_card(ack, body, respond, client):
+        try:
+            asyncio.run(ChannelMonitorAgent().handle_archive_action(ack, body, client, respond=respond))
+        except Exception:
+            logger.exception("Archive select card action failed")
+            respond(
+                {
+                    "text": "카드 선택 처리 중 오류가 발생했습니다.",
+                    "replace_original": False,
+                    "response_type": "ephemeral",
+                }
+            )
 
     return app
 
@@ -321,20 +383,126 @@ async def dispatch_text_command(text: str, prefer_help: bool = True) -> Optional
 
 
 async def dispatch_message_event(event: dict, client) -> Optional[Union[str, dict]]:
+    channel_monitor_response = await dispatch_channel_message_event(event, client)
+    if channel_monitor_response:
+        return channel_monitor_response
+
     text = (event.get("text") or "").strip()
     files = event.get("files") or []
     pending_key = _pending_upload_key(event)
+    if files:
+        logger.info(
+            "Slack file event received: channel=%s channel_type=%s subtype=%s files=%s text=%s",
+            event.get("channel"),
+            event.get("channel_type"),
+            event.get("subtype"),
+            [file.get("name") for file in files],
+            text,
+        )
+
+    if not files and text and _should_bypass_pending_flow(text):
+        return await dispatch_text_command(_strip_bot_mention(text), prefer_help=False)
+
+    if not files and text and pending_key in _PENDING_AFTER_PIPELINES:
+        return await _resolve_pending_after_confirm(event, client)
 
     if not files and text and pending_key in _PENDING_TRANSCRIPT_UPLOADS:
         return await _resolve_pending_transcript_upload(event, client)
 
-    if files and _looks_like_transcript_request(text, files):
-        return await _process_uploaded_transcript(event, client)
+    if files and (_looks_like_meeting_file_request(text, files) or _contains_supported_meeting_file(files)):
+        return await _process_uploaded_file(event, client)
 
     if event.get("channel_type") == "im" and text:
         return await dispatch_text_command(text, prefer_help=False)
 
     return None
+
+
+def _emit_say_response(say, response: Union[str, dict]) -> None:
+    """Slack Bolt say()에 문자열/딕셔너리 응답을 안전하게 전달"""
+    if isinstance(response, dict):
+        say(**response)
+        return
+    say(response)
+
+
+async def dispatch_channel_message_event(event: dict, client=None) -> Optional[dict]:
+    """채널 메시지용 channel monitor 진입점"""
+    agent = ChannelMonitorAgent()
+    return await agent.handle_channel_message(event, client=client)
+
+
+def _should_bypass_pending_flow(text: str) -> bool:
+    normalized = " ".join((text or "").split()).strip()
+    if not normalized:
+        return False
+    compact = re.sub(r"\s+", "", normalized.lower())
+    if normalized.startswith("<@"):
+        return True
+    bypass_keywords = [
+        "미팅 잡아줘",
+        "미팅일정 잡아줘",
+        "일정 잡아줘",
+        "회의 잡아줘",
+        "약속 잡아줘",
+        "브리핑해줘",
+        "결과 보여줘",
+        "상태 보여줘",
+        "운영 상태",
+        "캘린더 등록",
+    ]
+    return any(keyword.replace(" ", "") in compact for keyword in [item.replace(" ", "") for item in bypass_keywords])
+
+
+async def _handle_file_shared_event(event: dict, client) -> None:
+    file_id = event.get("file_id")
+    channel_id = event.get("channel_id") or event.get("channel")
+    user_id = event.get("user_id") or event.get("user")
+    if not file_id or not channel_id:
+        logger.info("Ignoring file_shared without file_id/channel_id: %s", event)
+        return
+
+    response = client.files_info(file=file_id)
+    file_info = response.get("file") or {}
+    file_kind = _classify_uploaded_file(file_info)
+    logger.info(
+        "file_shared received: channel=%s user=%s file=%s kind=%s",
+        channel_id,
+        user_id,
+        file_info.get("name"),
+        file_kind,
+    )
+
+    if file_kind != "text":
+        return
+    payload = _download_slack_text_file(file_info, client)
+    if not payload:
+        client.chat_postMessage(
+            channel=channel_id,
+            text="업로드한 텍스트 파일을 읽지 못했어요. txt, md, srt, vtt 형식인지 확인해주세요.",
+        )
+        return
+
+    candidates = _list_meeting_states(limit=5)
+    if not candidates:
+        client.chat_postMessage(
+            channel=channel_id,
+            text="업로드한 파일은 접수했지만 연결할 최근 미팅이 없어요. 먼저 미팅을 만들거나 meeting_id를 알려주세요.",
+        )
+        return
+
+    pending_key = channel_id or user_id or "default"
+    _PENDING_TRANSCRIPT_UPLOADS[pending_key] = {
+        "file_kind": file_kind,
+        "transcript": payload,
+        "candidates": candidates[:5],
+        "filename": file_info.get("name") or "업로드 파일",
+    }
+
+    client.chat_postMessage(
+        channel=channel_id,
+        text=_format_pending_transcript_prompt(file_info.get("name") or "업로드 파일", candidates[:5]),
+    )
 
 
 def _is_duplicate_event(event: dict) -> bool:
@@ -416,7 +584,7 @@ def _help_text() -> str:
     )
 
 
-def _looks_like_transcript_request(text: str, files: list) -> bool:
+def _looks_like_meeting_file_request(text: str, files: list) -> bool:
     normalized = " ".join((text or "").split()).strip().lower()
     keywords = ["회의록", "정리", "트랜스크립트", "transcript", "요약", "이 파일로", "이걸로"]
     if any(keyword in normalized for keyword in keywords):
@@ -431,9 +599,31 @@ def _looks_like_transcript_request(text: str, files: list) -> bool:
     return False
 
 
-async def _process_uploaded_transcript(event: dict, client) -> Union[str, dict]:
+def _contains_supported_meeting_file(files: list) -> bool:
+    for file in files:
+        if _classify_uploaded_file(file) == "text":
+            return True
+    return False
+
+
+def _classify_uploaded_file(file_info: dict) -> str:
+    name = (file_info.get("name") or "").lower()
+    mimetype = (file_info.get("mimetype") or "").lower()
+    if name.endswith((".txt", ".md", ".markdown", ".srt", ".vtt")) or mimetype.startswith("text/"):
+        return "text"
+    return "unknown"
+
+
+async def _process_uploaded_file(event: dict, client) -> Union[str, dict]:
     files = event.get("files") or []
-    transcript = _download_slack_text_file(files[0], client) if files else None
+    if not files:
+        return "업로드된 파일을 찾지 못했습니다."
+    primary_file = files[0]
+    file_kind = _classify_uploaded_file(primary_file)
+    if file_kind != "text":
+        return "지원하지 않는 파일 형식입니다. transcript(txt/md/srt/vtt) 파일을 올려주세요."
+
+    transcript = _download_slack_text_file(primary_file, client)
     if not transcript:
         return "업로드된 텍스트 파일을 읽지 못했습니다. txt, md, srt, vtt 형식으로 다시 올려주세요."
 
@@ -449,16 +639,17 @@ async def _process_uploaded_transcript(event: dict, client) -> Union[str, dict]:
             if not candidates:
                 return "연결할 미팅을 찾지 못했습니다. 먼저 미팅을 만들거나 meeting_id/미팅명을 함께 적어주세요."
             _PENDING_TRANSCRIPT_UPLOADS[_pending_upload_key(event)] = {
+                "file_kind": file_kind,
                 "transcript": transcript,
                 "candidates": candidates[:5],
-                "filename": (files[0].get("name") or "업로드 파일"),
+                "filename": (primary_file.get("name") or "업로드 파일"),
             }
-            return _format_pending_transcript_prompt(files[0].get("name") or "업로드 파일", candidates[:5])
+            return _format_pending_transcript_prompt(primary_file.get("name") or "업로드 파일", candidates[:5])
 
     if not meeting_id:
         return "최근 미팅이 없습니다. 먼저 미팅을 만들거나 meeting_id를 함께 적어주세요."
 
-    return await _run_transcript_pipeline(meeting_id, transcript)
+    return await _run_transcript_pipeline(meeting_id, transcript, pending_key=_pending_upload_key(event))
 
 
 def _download_slack_text_file(file_info: dict, client) -> Optional[str]:
@@ -532,22 +723,26 @@ def _match_recent_meetings_from_text(text: str) -> list:
 
 def _format_pending_transcript_prompt(filename: str, candidates: list) -> str:
     lines = [
-        f"업로드한 파일 `{filename}` 을 어느 미팅에 연결할까요?",
+        "🎧 음성 파일 업로드 완료",
+        "",
+        "파일명",
+        filename,
+        "",
+        "━━━━━━━━━━━━━━━━━━━━━━",
+        "",
+        "📌 연결할 미팅을 선택해주세요",
         "",
     ]
     for idx, entry in enumerate(candidates, start=1):
         title = entry.get("title", "미팅")
         start = _format_human_datetime(entry.get("start_time"))
-        meeting_id = entry.get("meeting_id", "")
         lines.append(f"{idx}. {title} ({start})")
-        if meeting_id:
-            lines.append(f"   - id: {meeting_id}")
     lines.extend(
         [
             "",
-            "번호나 meeting_id로 답장해주세요.",
-            "예: `1` 또는 `fhnj97oo5japovsl4pmu7827sc`",
-            "취소하려면 `취소`라고 보내주세요.",
+            "👉 번호 또는 meeting_id 입력",
+            "",
+            '(취소: "취소")',
         ]
     )
     return "\n".join(lines)
@@ -586,22 +781,26 @@ async def _resolve_pending_transcript_upload(event: dict, client) -> Optional[Un
         return "어느 미팅인지 못 찾았어요. 번호나 meeting_id로 다시 알려주세요."
 
     _PENDING_TRANSCRIPT_UPLOADS.pop(key, None)
-    return await _run_transcript_pipeline(meeting_id, pending.get("transcript", ""))
+    return await _run_transcript_pipeline(
+        meeting_id,
+        pending.get("transcript", ""),
+        pending_key=_pending_upload_key(event),
+    )
 
 
-async def _run_transcript_pipeline(meeting_id: str, transcript: str) -> Union[str, dict]:
+async def _run_transcript_pipeline(meeting_id: str, transcript: str, pending_key: Optional[str] = None) -> Union[str, dict]:
     success = await DuringAgent().process_meeting(
         meeting_id,
-        trigger_after_agent=True,
+        trigger_after_agent=False,
         transcript_text=transcript,
     )
     if not success:
         return "업로드한 transcript 처리에 실패했습니다. 파일 형식과 내용을 확인해주세요."
-
-    bundle = _build_meeting_bundle(meeting_id)
-    if bundle:
-        return _format_demo_result_payload(bundle)
-    return f"업로드한 transcript로 회의록 및 후속 처리를 완료했어요: {meeting_id}"
+    drive_svc = DriveService()
+    state = drive_svc.load_meeting_state(meeting_id) or {}
+    key = pending_key or meeting_id
+    _PENDING_AFTER_PIPELINES[key] = {"meeting_id": meeting_id}
+    return _format_notes_ready_message(meeting_id, state, drive_svc)
 
 
 def _format_human_datetime(value: Optional[str]) -> str:
@@ -612,6 +811,118 @@ def _format_human_datetime(value: Optional[str]) -> str:
         return dt.strftime("%m/%d %H:%M")
     except Exception:
         return str(value)
+
+
+def _format_processing_status(stage_label: str) -> str:
+    return (
+        "🔄 진행 상태\n\n"
+        "현재 단계\n"
+        f"→ {stage_label}\n\n"
+        "예상 작업\n"
+        "- 회의록 생성\n"
+        "- 액션아이템 추출\n\n"
+        "⏳ 잠시만 기다려주세요"
+    )
+
+
+def _response_to_text(response: Union[str, dict]) -> str:
+    if isinstance(response, str):
+        return response
+    if isinstance(response, dict):
+        return response.get("text") or "처리가 완료됐어요."
+    return "처리가 완료됐어요."
+
+
+def _format_notes_ready_message(meeting_id: str, state: dict, drive_svc: DriveService) -> str:
+    title = state.get("title") or meeting_id
+    client_path = f"{Config.MEETING_NOTES_FOLDER}/{meeting_id}_client.md"
+    internal_path = f"{Config.MEETING_NOTES_FOLDER}/{meeting_id}_internal.md"
+    client_link = _format_artifact_reference(drive_svc, client_path, "클라이언트용 회의록")
+    internal_link = _format_artifact_reference(drive_svc, internal_path, "내부용 회의록")
+    return "\n".join(
+        [
+            "✅ 회의록 생성 완료",
+            "",
+            "대상 미팅",
+            title,
+            "",
+            "━━━━━━━━━━━━━━━━━━━━━━",
+            "",
+            "생성된 파일",
+            f"• {client_link}",
+            f"• {internal_link}",
+            "",
+            "다음 작업",
+            "- Slack 요약 Draft 생성",
+            "- Trello 업데이트 준비",
+            "- 제안서/Contacts 업데이트",
+            "",
+            "👉 추가 작업을 진행하시겠어요?",
+            "진행: `후속 진행`",
+            "중지: `여기까지`",
+        ]
+    )
+
+
+async def _resolve_pending_after_confirm(event: dict, client) -> Optional[Union[str, dict]]:
+    key = _pending_upload_key(event)
+    pending = _PENDING_AFTER_PIPELINES.get(key)
+    if not pending:
+        return None
+
+    text = " ".join(((event.get("text") or "").split())).strip()
+    if not text:
+        return "추가 작업을 진행하려면 `후속 진행`, 중지하려면 `여기까지`라고 답장해주세요."
+
+    if text in {"여기까지", "중지", "취소"}:
+        _PENDING_AFTER_PIPELINES.pop(key, None)
+        return "알겠습니다. 회의록까지만 생성하고 후속 작업은 진행하지 않을게요."
+
+    if text not in {"후속 진행", "진행", "계속", "추가 작업 진행"}:
+        return "후속 작업을 진행하려면 `후속 진행`, 중지하려면 `여기까지`라고 답장해주세요."
+
+    meeting_id = pending.get("meeting_id")
+    _PENDING_AFTER_PIPELINES.pop(key, None)
+    _start_background_task(_continue_after_pipeline(meeting_id, event.get("channel"), client))
+    return "\n".join(
+        [
+            "🔄 진행 상태",
+            "",
+            "현재 단계",
+            "→ 후속 작업 생성 중",
+            "",
+            "예상 작업",
+            "- Slack 요약 Draft 생성",
+            "- Trello 업데이트 준비",
+            "- 제안서/Contacts 업데이트",
+            "",
+            "⏳ 잠시만 기다려주세요",
+        ]
+    )
+
+
+async def _continue_after_pipeline(meeting_id: str, channel: Optional[str], client) -> None:
+    success = await AfterAgent().process_meeting(meeting_id)
+    if not success:
+        _post_background_message(client, channel, "후속 작업 생성에 실패했어요. 잠시 후 다시 시도해주세요.")
+        return
+
+    bundle = _build_meeting_bundle(meeting_id)
+    if bundle:
+        payload = _format_demo_result_payload(bundle)
+        _post_background_message(client, channel, _response_to_text(payload))
+    else:
+        _post_background_message(client, channel, f"후속 작업을 완료했어요: {meeting_id}")
+
+
+def _render_transcript_text(segments: list, fallback: str = "") -> str:
+    lines = []
+    for segment in segments:
+        speaker = (segment.get("speaker") or "Speaker").strip()
+        text = (segment.get("text") or "").strip()
+        if text:
+            lines.append(f"{speaker}: {text}")
+    return "\n".join(lines) or fallback
 
 
 async def _route_with_llm(text: str) -> Optional[dict]:

@@ -6,9 +6,13 @@ def install_dependency_stubs():
     if "anthropic" not in sys.modules:
         anthropic_module = types.ModuleType("anthropic")
 
+        class _Messages:
+            def create(self, *args, **kwargs):
+                return types.SimpleNamespace(content=[types.SimpleNamespace(text="{}")])
+
         class Anthropic:
             def __init__(self, *args, **kwargs):
-                pass
+                self.messages = _Messages()
 
         anthropic_module.Anthropic = Anthropic
         sys.modules["anthropic"] = anthropic_module
@@ -16,9 +20,18 @@ def install_dependency_stubs():
     if "trello" not in sys.modules:
         trello_module = types.ModuleType("trello")
 
+        class _DummyBoard:
+            name = "Dummy Board"
+
+            def all_cards(self):
+                return []
+
         class TrelloClient:
             def __init__(self, *args, **kwargs):
                 pass
+
+            def get_board(self, *args, **kwargs):
+                return _DummyBoard()
 
         trello_module.TrelloClient = TrelloClient
         sys.modules["trello"] = trello_module
@@ -37,6 +50,14 @@ def install_dependency_stubs():
         class WebClient:
             def __init__(self, *args, **kwargs):
                 pass
+
+            def chat_getPermalink(self, *args, **kwargs):
+                channel = kwargs.get("channel", "C123")
+                ts = kwargs.get("message_ts", "123.456")
+                return {"permalink": f"https://slack.test/archives/{channel}/p{str(ts).replace('.', '')}"}
+
+            def conversations_history(self, *args, **kwargs):
+                return {"messages": []}
 
         slack_sdk_module.WebClient = WebClient
         sys.modules["slack_sdk"] = slack_sdk_module
@@ -64,6 +85,11 @@ def install_dependency_stubs():
                 return decorator
 
             def event(self, *args, **kwargs):
+                def decorator(func):
+                    return func
+                return decorator
+
+            def action(self, *args, **kwargs):
                 def decorator(func):
                     return func
                 return decorator

@@ -56,6 +56,14 @@ Slack에서 transcript 파일을 업로드한 뒤 정리를 요청할 수 있습
 
 설명이 부족하면 봇이 최근 미팅 후보를 보여주고 어느 미팅에 연결할지 다시 묻습니다.
 
+### 4. transcript 업로드 기반 정리
+
+Slack에서 transcript 파일(`txt`, `md`, `srt`, `vtt`)을 올리면 Meetagain이:
+
+1. 미팅 연결 대상을 확인하고
+2. 회의록을 생성한 뒤
+3. 추가 후속 작업 여부를 다시 묻습니다.
+
 ## 아키텍처
 
 ### Before Agent
@@ -75,6 +83,16 @@ Slack에서 transcript 파일을 업로드한 뒤 정리를 요청할 수 있습
 - Trello 업데이트
 - Contacts 문서 업데이트
 - 제안서 / 리서치 초안 생성
+
+### Channel Monitor v1
+- 기본값은 일일 배치 전용
+- 필요할 때만 개인 DM 실시간 감지
+- 채널/비공개채널 일일 배치 수집
+- 아카이빙 가치 판단
+- Trello 카드 추천
+- 액션아이템 최대 3개 추출
+- Slack 스레드 확인용 Block Kit payload 생성
+- 애매한 메시지는 리뷰 큐로 별도 집계
 
 ## 기술 스택
 
@@ -142,7 +160,31 @@ python3 -m src.app
 python3 -m unittest tests.test_app_unittest
 python3 -m unittest tests.test_after_agent_unittest
 python3 -m unittest tests.test_calendar_service_unittest
+python3 -m unittest tests.test_channel_monitor_agent_unittest
+python3 -m unittest tests.test_cli_unittest tests.test_services_dry_run_unittest
 ```
+
+### 5. 채널 모니터 일일 배치
+
+전일 `17:00`부터 당일 `17:00`까지 지정 채널을 수집하고, 자동 제안과 리뷰 후보를 같이 만듭니다.
+
+```bash
+python3 -m src.cli channel-monitor-daily --channel C01234567 --json
+```
+
+리뷰 큐를 본인 DM이나 지정 채널로 보내려면:
+
+```bash
+python3 -m src.cli channel-monitor-daily --channel C01234567 --send-dm-email me@parametacorp.com
+python3 -m src.cli channel-monitor-daily --channel C01234567 --send-channel D01234567
+```
+
+환경 변수로 기본 대상을 고정할 수도 있습니다.
+- `CHANNEL_MONITOR_BATCH_HOUR`
+- `CHANNEL_MONITOR_TARGET_CHANNELS`
+- `CHANNEL_MONITOR_REVIEW_DM_EMAIL`
+- `CHANNEL_MONITOR_REVIEW_CHANNEL`
+- `ENABLE_CHANNEL_MONITOR_REALTIME=false`
 
 ## 운영/설계 문서
 

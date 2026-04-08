@@ -63,11 +63,22 @@ class Config:
     MEETING_NOTES_FOLDER = os.getenv("MEETING_NOTES_FOLDER", "MeetingNotes")
     GENERATED_DRAFTS_FOLDER = os.getenv("GENERATED_DRAFTS_FOLDER", "GeneratedDrafts")
     MEETING_STATE_FOLDER = os.getenv("MEETING_STATE_FOLDER", "MeetingState")
-    
+
     # ============ Feature Flags ============
     ENABLE_AGENDA_AUTO_REGISTER = os.getenv("ENABLE_AGENDA_AUTO_REGISTER", "true").lower() == "true"
     ENABLE_CONTACT_AUTO_SAVE = os.getenv("ENABLE_CONTACT_AUTO_SAVE", "true").lower() == "true"
     ENABLE_CALENDAR_AGENDA_SYNC = os.getenv("ENABLE_CALENDAR_AGENDA_SYNC", "true").lower() == "true"
+    ENABLE_CHANNEL_MONITOR = os.getenv("ENABLE_CHANNEL_MONITOR", "true").lower() == "true"
+    ENABLE_CHANNEL_MONITOR_REALTIME = os.getenv("ENABLE_CHANNEL_MONITOR_REALTIME", "false").lower() == "true"
+    CHANNEL_MONITOR_MIN_TEXT_LENGTH = int(os.getenv("CHANNEL_MONITOR_MIN_TEXT_LENGTH", "10"))
+    CHANNEL_MONITOR_BATCH_HOUR = int(os.getenv("CHANNEL_MONITOR_BATCH_HOUR", "17"))
+    CHANNEL_MONITOR_TARGET_CHANNELS = [
+        item.strip() for item in os.getenv("CHANNEL_MONITOR_TARGET_CHANNELS", "").split(",") if item.strip()
+    ]
+    CHANNEL_MONITOR_REVIEW_DM_EMAIL = os.getenv("CHANNEL_MONITOR_REVIEW_DM_EMAIL", "")
+    CHANNEL_MONITOR_REVIEW_CHANNEL = os.getenv("CHANNEL_MONITOR_REVIEW_CHANNEL", "")
+
+    # ============ ASR ============
     
     # ============ 내부 도메인 ============
     INTERNAL_DOMAINS = {"parametacorp.com", "iconloop.com"}

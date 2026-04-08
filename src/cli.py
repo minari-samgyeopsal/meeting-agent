@@ -20,6 +20,8 @@ from typing import Optional
 from src.agents.before_agent import BeforeAgent
 from src.agents.during_agent import DuringAgent
 from src.agents.after_agent import AfterAgent
+from src.agents.channel_monitor_agent import ChannelMonitorAgent
+from src.services.slack_service import SlackService
 from src.utils.config import Config
 from src.utils.meeting_state import get_follow_up_needed, resolve_auto_rerun_stage
 from src.utils.status_formatter import format_meeting_status
@@ -333,6 +335,22 @@ async def main():
     after_parser = subparsers.add_parser("after", help="After Agent 실행")
     after_parser.add_argument("--meeting-id", required=True, help="Calendar event ID")
 
+    channel_monitor_daily_parser = subparsers.add_parser(
+        "channel-monitor-daily",
+        help="전일 17시 ~ 당일 17시 기준 채널 메시지 배치 수집",
+    )
+    channel_monitor_daily_parser.add_argument("--channel", action="append", help="채널 ID 또는 이름, 여러 번 반복 가능")
+    channel_monitor_daily_parser.add_argument("--window-end", help="기준 시각 ISO format")
+    channel_monitor_daily_parser.add_argument("--json", action="store_true", help="결과를 JSON으로 출력")
+    channel_monitor_daily_parser.add_argument(
+        "--send-dm-email",
+        help="리뷰 큐를 보낼 Slack 사용자 이메일. 미지정 시 CHANNEL_MONITOR_REVIEW_DM_EMAIL 사용",
+    )
+    channel_monitor_daily_parser.add_argument(
+        "--send-channel",
+        help="리뷰 큐를 보낼 Slack 채널/DM 채널 ID. 미지정 시 CHANNEL_MONITOR_REVIEW_CHANNEL 사용",
+    )
+
     rerun_parser = subparsers.add_parser("rerun", help="meeting_id 기준 단계 재실행")
     rerun_parser.add_argument("--meeting-id", required=True, help="Calendar event ID")
     rerun_parser.add_argument(
@@ -376,6 +394,30 @@ async def main():
         agent = AfterAgent()
         success = await agent.process_meeting(args.meeting_id)
         raise SystemExit(0 if success else 1)
+
+    if args.command == "channel-monitor-daily":
+        if not Config.validate(["SLACK_BOT_TOKEN"]):
+            raise SystemExit(1)
+        channels = args.channel or Config.CHANNEL_MONITOR_TARGET_CHANNELS
+        if not channels:
+            print("수집할 채널이 없습니다. --channel 또는 CHANNEL_MONITOR_TARGET_CHANNELS를 설정하세요.")
+            raise SystemExit(1)
+        reference = datetime.fromisoformat(args.window_end) if args.window_end else None
+        report = await ChannelMonitorAgent().run_daily_collection(channels=channels, reference=reference)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(_render_channel_monitor_daily_report(report))
+        send_channel = getattr(args, "send_channel", None) or Config.CHANNEL_MONITOR_REVIEW_CHANNEL
+        send_dm_email = getattr(args, "send_dm_email", None) or Config.CHANNEL_MONITOR_REVIEW_DM_EMAIL
+        if send_channel or send_dm_email:
+            delivery = _send_channel_monitor_review_queue(
+                report,
+                send_channel=send_channel,
+                send_dm_email=send_dm_email,
+            )
+            print(delivery)
+        raise SystemExit(0)
 
     if args.command == "pipeline":
         if not Config.validate(["ANTHROPIC_API_KEY"]):
@@ -653,6 +695,97 @@ def _resolve_smoke_transcript(args: SimpleNamespace, during_agent: DuringAgent) 
         return during_agent.load_transcript_from_file(transcript_file)
 
     return _build_smoke_transcript(args.title, args.agenda)
+
+
+def _render_channel_monitor_daily_report(report: dict) -> str:
+    lines = [
+        "채널 모니터 일일 수집 결과",
+        f"- 수집 창 시작: {report.get('window_start', '')}",
+        f"- 수집 창 종료: {report.get('window_end', '')}",
+        f"- 대상 채널: {', '.join(report.get('channels', [])) or '없음'}",
+        f"- 스캔 메시지 수: {report.get('scanned_count', 0)}",
+        f"- 제안 생성 수: {report.get('proposal_count', 0)}",
+        f"- 리뷰 후보 수: {report.get('review_candidate_count', 0)}",
+    ]
+    for item in report.get("proposals", [])[:10]:
+        headline = (item.get("text", "") or "").splitlines()[0]
+        lines.append(
+            f"- [{item.get('channel', '')}] {item.get('ts', '')} | score={item.get('score', 0)} | {headline}"
+        )
+    review_candidates = report.get("review_candidates", [])
+    if review_candidates:
+        lines.append("")
+        lines.append("리뷰 후보")
+        for item in review_candidates[:10]:
+            lines.append(
+                f"- [{item.get('channel', '')}] {item.get('ts', '')} | score={item.get('score', 0)} | "
+                f"{item.get('headline', '')} | reasons={', '.join(item.get('reasons', []))}"
+            )
+    return "\n".join(lines)
+
+
+def _send_channel_monitor_review_queue(
+    report: dict,
+    send_channel: Optional[str] = None,
+    send_dm_email: Optional[str] = None,
+) -> str:
+    slack_svc = SlackService()
+    payload = slack_svc.build_channel_monitor_review_queue_message(report)
+    sent_followups = 0
+
+    if send_channel:
+        ts = slack_svc.send_message(send_channel, payload["text"], payload.get("blocks"))
+        if ts:
+            sent_followups = _send_channel_monitor_proposals(
+                slack_svc=slack_svc,
+                report=report,
+                channel=send_channel,
+            )
+        return (
+            f"리뷰 큐 전송: channel={send_channel} ts={ts or 'failed'} "
+            f"(actionable_items={sent_followups})"
+        )
+
+    if send_dm_email:
+        ts = slack_svc.send_dm(send_dm_email, payload["text"], payload.get("blocks"))
+        if ts:
+            dm_channel = _resolve_dm_channel_id(slack_svc, send_dm_email)
+            if dm_channel:
+                sent_followups = _send_channel_monitor_proposals(
+                    slack_svc=slack_svc,
+                    report=report,
+                    channel=dm_channel,
+                )
+        return (
+            f"리뷰 큐 전송: dm={send_dm_email} ts={ts or 'failed'} "
+            f"(actionable_items={sent_followups})"
+        )
+
+    return "리뷰 큐 전송 대상이 설정되지 않았습니다."
+
+
+def _resolve_dm_channel_id(slack_svc: SlackService, email: str) -> Optional[str]:
+    try:
+        if Config.DRY_RUN:
+            return "DRYRUN_DM_CHANNEL"
+        user_id = slack_svc.get_user_id(email)
+        if not user_id or not slack_svc.client:
+            return None
+        response = slack_svc.client.conversations_open(users=[user_id])
+        return response.get("channel", {}).get("id")
+    except Exception:
+        return None
+
+
+def _send_channel_monitor_proposals(slack_svc: SlackService, report: dict, channel: str) -> int:
+    count = 0
+    for item in (report.get("proposals") or [])[:5]:
+        blocks = item.get("blocks") or []
+        text = item.get("text") or "Meetagain 아카이빙 제안"
+        ts = slack_svc.send_message(channel, text, blocks)
+        if ts:
+            count += 1
+    return count
 
 
 def _build_smoke_transcript(title: str, agenda: str) -> str:

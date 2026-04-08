@@ -60,6 +60,33 @@ class ServicesDryRunUnitTest(unittest.TestCase):
             Config.DRY_RUN = original
             Config.SLACK_BOT_TOKEN = original_slack
 
+    def test_slack_service_builds_channel_monitor_review_queue_message(self):
+        service = SlackService()
+        payload = service.build_channel_monitor_review_queue_message(
+            {
+                "window_start": "2026-04-04T17:00:00+09:00",
+                "window_end": "2026-04-05T17:00:00+09:00",
+                "channels": ["C_BIZ"],
+                "scanned_count": 12,
+                "proposal_count": 2,
+                "review_candidate_count": 1,
+                "proposals": [
+                    {"channel": "C_BIZ", "score": 4, "text": "🤖 Meetagain 아카이빙 제안\n미래에셋 미팅"}
+                ],
+                "review_candidates": [
+                    {
+                        "channel": "C_BIZ",
+                        "score": 2,
+                        "headline": "법률 검토 필요 여부 확인",
+                        "reasons": ["외부 협업/법률 맥락", "구체 실행/리스크 키워드"],
+                    }
+                ],
+            }
+        )
+        self.assertIn("Meetagain 일일 정리 후보", payload["text"])
+        self.assertEqual(payload["blocks"][0]["type"], "section")
+        self.assertIn("한 번 더 보면 좋을 항목", payload["blocks"][-1]["text"]["text"])
+
     def test_trello_service_returns_dummy_card_in_dry_run(self):
         original = Config.DRY_RUN
         original_key = Config.TRELLO_API_KEY
