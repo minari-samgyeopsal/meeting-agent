@@ -5,7 +5,8 @@ from tests.test_support import install_dependency_stubs
 
 install_dependency_stubs()
 
-from src.cli import _send_channel_monitor_review_queue
+from src.cli import _build_doctor_report, _send_channel_monitor_review_queue
+from src.utils.config import Config
 
 
 class CliUnitTest(unittest.TestCase):
@@ -47,6 +48,21 @@ class CliUnitTest(unittest.TestCase):
         self.assertIn("channel=D123", message)
         self.assertIn("1775.2", message)
         self.assertIn("actionable_items=1", message)
+
+    def test_build_doctor_report_marks_trello_unready_when_connection_fails(self):
+        original_dry_run = Config.DRY_RUN
+        original_dry_run_trello = Config.DRY_RUN_TRELLO
+        try:
+            Config.DRY_RUN = False
+            Config.DRY_RUN_TRELLO = False
+            with patch("src.cli.TrelloService") as trello_service:
+                trello_service.return_value.board = None
+                report = _build_doctor_report(limit=1)
+            self.assertFalse(report["live_checks"]["trello_connected"])
+            self.assertFalse(report["live_checks"]["core_live_ready"])
+        finally:
+            Config.DRY_RUN = original_dry_run
+            Config.DRY_RUN_TRELLO = original_dry_run_trello
 
 
 if __name__ == "__main__":

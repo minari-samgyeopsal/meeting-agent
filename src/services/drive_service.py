@@ -10,12 +10,16 @@ Google Drive 서비스 (gws CLI 기반)
 - search_contacts: Contacts 폴더 검색
 """
 
-import subprocess
 import json
+import subprocess
 import tempfile
 from pathlib import Path
 from datetime import datetime
 from typing import Optional, List, Dict
+
+import requests
+
+from src.auth.google_auth_service import GoogleAuthService
 from src.models.contact import Company, Person
 from src.utils.config import Config
 from src.utils.logger import get_logger
@@ -28,6 +32,7 @@ class DriveService:
     
     def __init__(self):
         self.cmd_prefix = [Config.gws_bin(), "drive"]
+        self.google_auth_svc = GoogleAuthService()
         self.contacts_folder = Config.CONTACTS_FOLDER
         self.company_knowledge_file = Config.COMPANY_KNOWLEDGE_FILE
         self.transcripts_folder = Config.MEETING_TRANSCRIPTS_FOLDER
@@ -390,6 +395,12 @@ class DriveService:
                 logger.debug(f"Dry-run Drive file not found: {filepath}")
                 return None
 
+            oauth_content = self._read_text_file_via_google_oauth(filepath)
+            if oauth_content is not None:
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_text(oauth_content, encoding="utf-8")
+                return oauth_content
+
             file_id = self._find_drive_file_id(filepath)
             if not file_id:
                 return None
@@ -438,6 +449,13 @@ class DriveService:
                 local_path.parent.mkdir(parents=True, exist_ok=True)
                 local_path.write_text(content, encoding="utf-8")
                 logger.info(f"[DRY RUN] Drive file saved locally: {local_path}")
+                return True
+
+            if self._write_text_file_via_google_oauth(filepath, content):
+                local_path = self._dry_run_path(filepath)
+                local_path.parent.mkdir(parents=True, exist_ok=True)
+                local_path.write_text(content, encoding="utf-8")
+                logger.info(f"Drive file saved via Google OAuth: {filepath}")
                 return True
 
             file_id = self._find_drive_file_id(filepath)
@@ -556,6 +574,10 @@ class DriveService:
     def _find_drive_file_id(self, filepath: str) -> Optional[str]:
         """appProperties에 저장한 가상 경로 기준으로 Drive 파일 조회"""
         try:
+            file_id = self._find_drive_file_id_via_google_oauth(filepath)
+            if file_id:
+                return file_id
+
             query = (
                 "appProperties has "
                 "{ key='meetagain_path' and value='%s' } and trashed = false"
@@ -593,3 +615,165 @@ class DriveService:
         except Exception as e:
             logger.debug(f"Error finding Drive file id for {filepath}: {e}")
             return None
+
+    def _read_text_file_via_google_oauth(self, filepath: str) -> Optional[str]:
+        try:
+            file_id = self._find_drive_file_id_via_google_oauth(filepath)
+            if not file_id:
+                return None
+            response = self._google_drive_request(
+                "GET",
+                f"/files/{file_id}",
+                params={"alt": "media"},
+                raw=True,
+            )
+            if response is None:
+                return None
+            return response.text
+        except Exception as e:
+            logger.warning(f"Google OAuth Drive read failed, falling back to gws: {e}")
+            return None
+
+    def _write_text_file_via_google_oauth(self, filepath: str, content: str) -> bool:
+        try:
+            file_id = self._find_drive_file_id_via_google_oauth(filepath)
+            mime_type = "text/markdown" if filepath.endswith(".md") else "text/plain"
+            if file_id:
+                response = self._google_drive_upload(
+                    method="PATCH",
+                    file_id=file_id,
+                    metadata=None,
+                    content=content,
+                    mime_type=mime_type,
+                )
+            else:
+                response = self._google_drive_upload(
+                    method="POST",
+                    metadata={"name": Path(filepath).name, "appProperties": {"meetagain_path": filepath}},
+                    content=content,
+                    mime_type=mime_type,
+                )
+            if not response:
+                return False
+            resolved_file_id = response.get("id")
+            if resolved_file_id:
+                self._store_drive_file_id(filepath, resolved_file_id)
+            return True
+        except Exception as e:
+            logger.warning(f"Google OAuth Drive write failed, falling back to gws: {e}")
+            return False
+
+    def _find_drive_file_id_via_google_oauth(self, filepath: str) -> Optional[str]:
+        try:
+            access_token = self.google_auth_svc.get_valid_access_token()
+            if not access_token:
+                return None
+            query = (
+                "appProperties has "
+                "{ key='meetagain_path' and value='%s' } and trashed = false"
+            ) % filepath.replace("'", "\\'")
+            payload = self._google_drive_request(
+                "GET",
+                "/files",
+                params={
+                    "q": query,
+                    "pageSize": 1,
+                    "fields": "files(id,name,appProperties,webViewLink)",
+                    "supportsAllDrives": "true",
+                    "includeItemsFromAllDrives": "true",
+                },
+            )
+            files = (payload or {}).get("files", [])
+            if not files:
+                return None
+            return files[0].get("id")
+        except Exception as e:
+            logger.warning(f"Google OAuth Drive lookup failed, falling back to gws: {e}")
+            return None
+
+    def _google_drive_request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        json_body: Optional[dict] = None,
+        raw: bool = False,
+    ):
+        access_token = self.google_auth_svc.get_valid_access_token()
+        if not access_token:
+            return None
+        response = requests.request(
+            method,
+            f"https://www.googleapis.com/drive/v3{path}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+            json=json_body,
+            timeout=20,
+        )
+        response.raise_for_status()
+        if raw:
+            return response
+        if not response.text:
+            return {}
+        return response.json()
+
+    def _google_drive_upload(
+        self,
+        method: str,
+        content: str,
+        mime_type: str,
+        metadata: Optional[dict] = None,
+        file_id: Optional[str] = None,
+    ) -> Optional[dict]:
+        access_token = self.google_auth_svc.get_valid_access_token()
+        if not access_token:
+            return None
+
+        if method == "PATCH" and file_id:
+            url = f"https://www.googleapis.com/upload/drive/v3/files/{file_id}"
+            if metadata is None:
+                response = requests.request(
+                    method,
+                    url,
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": mime_type,
+                    },
+                    params={"uploadType": "media", "supportsAllDrives": "true"},
+                    data=content.encode("utf-8"),
+                    timeout=20,
+                )
+                response.raise_for_status()
+                if not response.text:
+                    return {}
+                return response.json()
+        else:
+            url = "https://www.googleapis.com/upload/drive/v3/files"
+
+        boundary = "meetagain-drive-boundary"
+        metadata_json = json.dumps(metadata or {}, ensure_ascii=False)
+        body = (
+            f"--{boundary}\r\n"
+            "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+            f"{metadata_json}\r\n"
+            f"--{boundary}\r\n"
+            f"Content-Type: {mime_type}\r\n\r\n"
+            f"{content}\r\n"
+            f"--{boundary}--\r\n"
+        ).encode("utf-8")
+
+        response = requests.request(
+            method,
+            url,
+            headers={
+                "Authorization": f"Bearer {access_token}",
+                "Content-Type": f"multipart/related; boundary={boundary}",
+            },
+            params={"uploadType": "multipart", "supportsAllDrives": "true"},
+            data=body,
+            timeout=20,
+        )
+        response.raise_for_status()
+        if not response.text:
+            return {}
+        return response.json()

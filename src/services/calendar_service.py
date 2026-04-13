@@ -12,9 +12,14 @@ Google Calendar 서비스 (gws CLI 기반)
 import subprocess
 import json
 import uuid
+import re
 from datetime import datetime, timedelta
 from typing import List, Optional
+from urllib.parse import quote
 from zoneinfo import ZoneInfo
+import requests
+
+from src.auth.google_auth_service import GoogleAuthService
 from src.models.meeting import Meeting
 from src.utils.config import Config
 from src.utils.logger import get_logger
@@ -25,9 +30,26 @@ logger = get_logger(__name__)
 
 class CalendarService:
     """Google Calendar 조작"""
+
+    EXTERNAL_TITLE_MARKERS = [
+        "카카오", "kakao", "네이버", "naver", "라인", "line",
+        "쿠팡", "coupang", "당근", "토스", "toss", "lg전자",
+        "삼성전자", "현대", "신한", "국민", "우리", "하나",
+    ]
+    EXTERNAL_COMPANY_SUFFIXES = [
+        "전자", "카드", "은행", "증권", "캐피탈", "보험", "생명",
+        "화재", "건설", "물산", "그룹", "리츠", "게임즈", "테크",
+        "랩스", "모빌리티", "바이오", "제약", "에너지", "스튜디오",
+    ]
+    INTERNAL_TITLE_MARKERS = [
+        "집", "사무실", "휴가", "연차", "병원", "운동", "개인",
+        "internal", "내부", "사내", "weekly sync", "weekly", "sync",
+        "standup", "1:1", "one-on-one", "all hands", "타운홀", "회고",
+    ]
     
     def __init__(self):
         self.cmd_prefix = [Config.gws_bin(), "calendar"]
+        self.google_auth_svc = GoogleAuthService()
 
     def _local_timezone(self):
         try:
@@ -49,11 +71,24 @@ class CalendarService:
             return True
 
         normalized_title = (title or "").lower()
-        external_markers = [
-            "카카오", "kakao", "네이버", "naver", "라인", "line",
-            "쿠팡", "coupang", "당근", "토스", "toss",
-        ]
-        return any(marker in normalized_title for marker in external_markers)
+        if not normalized_title:
+            return False
+
+        if any(marker in normalized_title for marker in self.EXTERNAL_TITLE_MARKERS):
+            return True
+
+        if any(marker in normalized_title for marker in self.INTERNAL_TITLE_MARKERS):
+            return False
+
+        # 참석자 정보가 비어 있는 캘린더 이벤트는 제목에서 회사명처럼 보이는 토큰을 한 번 더 본다.
+        for token in re.split(r"[\s/()\-_,]+", title or ""):
+            cleaned = token.strip()
+            if len(cleaned) < 2:
+                continue
+            if any(suffix in cleaned for suffix in self.EXTERNAL_COMPANY_SUFFIXES):
+                return True
+
+        return False
     
     def get_upcoming_meetings(self, hours: int = 24) -> List[Meeting]:
         """
@@ -70,6 +105,10 @@ class CalendarService:
                 meetings = self._build_dry_run_upcoming_meetings(hours)
                 logger.info(f"[DRY RUN] Found {len(meetings)} upcoming meetings in {hours}h")
                 return meetings
+
+            oauth_meetings = self._get_upcoming_meetings_via_google_oauth(hours)
+            if oauth_meetings is not None:
+                return oauth_meetings
 
             now = datetime.now(self._local_timezone())
             time_max = now + timedelta(hours=hours)
@@ -262,6 +301,10 @@ class CalendarService:
                     meet_url=fake_meet_url,
                     calendar_url="dry-run://calendar-event",
                 )
+
+            oauth_meeting = self._create_meeting_via_google_oauth(title, start_time, end_time, attendees, description)
+            if oauth_meeting is not None:
+                return oauth_meeting
             
             body = {
                 "summary": title,
@@ -366,6 +409,10 @@ class CalendarService:
             if Config.DRY_RUN_CALENDAR:
                 logger.info(f"[DRY RUN] Would add attendees to {meeting_id}: {attendees}")
                 return True
+
+            oauth_result = self._add_attendees_via_google_oauth(meeting_id, attendees)
+            if oauth_result is not None:
+                return oauth_result
             
             event = self._get_event(meeting_id)
             if not event:
@@ -413,6 +460,10 @@ class CalendarService:
             if Config.DRY_RUN_CALENDAR:
                 logger.info(f"[DRY RUN] Would update description for {meeting_id}")
                 return True
+
+            oauth_result = self._update_description_via_google_oauth(meeting_id, description)
+            if oauth_result is not None:
+                return oauth_result
             
             cmd = self.cmd_prefix + [
                 "events",
@@ -439,6 +490,10 @@ class CalendarService:
     def _get_event(self, meeting_id: str) -> Optional[dict]:
         """이벤트 단건 조회"""
         try:
+            oauth_event = self._get_event_via_google_oauth(meeting_id)
+            if oauth_event is not None:
+                return oauth_event
+
             cmd = self.cmd_prefix + [
                 "events",
                 "get",
@@ -453,3 +508,138 @@ class CalendarService:
         except Exception as e:
             logger.error(f"Error getting event {meeting_id}: {e}")
             return None
+
+    def _get_upcoming_meetings_via_google_oauth(self, hours: int) -> Optional[List[Meeting]]:
+        try:
+            payload = self._google_calendar_request(
+                "GET",
+                "/calendars/primary/events",
+                params=self._build_events_list_params(hours),
+            )
+            if payload is None:
+                return None
+            events = payload.get("items", []) if isinstance(payload, dict) else []
+            meetings = [self._parse_event(event) for event in events]
+            logger.info(f"Found {len(meetings)} upcoming meetings in {hours}h via Google OAuth")
+            return meetings
+        except Exception as e:
+            logger.warning(f"Google OAuth calendar list failed, falling back to gws: {e}")
+            return None
+
+    def _create_meeting_via_google_oauth(
+        self,
+        title: str,
+        start_time: datetime,
+        end_time: datetime,
+        attendees: List[str],
+        description: str,
+    ) -> Optional[Meeting]:
+        try:
+            event = self._google_calendar_request(
+                "POST",
+                "/calendars/primary/events",
+                params={"sendUpdates": "all", "conferenceDataVersion": 1},
+                json_body={
+                    "summary": title,
+                    "description": description,
+                    "start": {"dateTime": self._as_rfc3339(start_time), "timeZone": Config.TIMEZONE},
+                    "end": {"dateTime": self._as_rfc3339(end_time), "timeZone": Config.TIMEZONE},
+                    "attendees": [{"email": attendee} for attendee in attendees],
+                    "conferenceData": {
+                        "createRequest": {
+                            "requestId": f"meetagain-{uuid.uuid4().hex[:12]}",
+                            "conferenceSolutionKey": {"type": "hangoutsMeet"},
+                        }
+                    },
+                },
+            )
+            if event is None:
+                return None
+            meeting = self._parse_event(event)
+            logger.info(f"Meeting created via Google OAuth: {title} ({meeting.id})")
+            return meeting
+        except Exception as e:
+            logger.warning(f"Google OAuth create meeting failed, falling back to gws: {e}")
+            return None
+
+    def _add_attendees_via_google_oauth(self, meeting_id: str, attendees: List[str]) -> Optional[bool]:
+        try:
+            event = self._get_event_via_google_oauth(meeting_id)
+            if event is None:
+                return None
+            current = event.get("attendees", [])
+            existing = {item.get("email") for item in current if item.get("email")}
+            merged = current + [{"email": attendee} for attendee in attendees if attendee not in existing]
+            result = self._google_calendar_request(
+                "PATCH",
+                f"/calendars/primary/events/{quote(meeting_id, safe='')}",
+                params={"sendUpdates": "all"},
+                json_body={"attendees": merged},
+            )
+            if result is None:
+                return None
+            logger.info(f"Attendees added via Google OAuth to {meeting_id}: {attendees}")
+            return True
+        except Exception as e:
+            logger.warning(f"Google OAuth add attendees failed, falling back to gws: {e}")
+            return None
+
+    def _update_description_via_google_oauth(self, meeting_id: str, description: str) -> Optional[bool]:
+        try:
+            result = self._google_calendar_request(
+                "PATCH",
+                f"/calendars/primary/events/{quote(meeting_id, safe='')}",
+                params={"sendUpdates": "all"},
+                json_body={"description": description},
+            )
+            if result is None:
+                return None
+            logger.info(f"Meeting description updated via Google OAuth: {meeting_id}")
+            return True
+        except Exception as e:
+            logger.warning(f"Google OAuth update description failed, falling back to gws: {e}")
+            return None
+
+    def _get_event_via_google_oauth(self, meeting_id: str) -> Optional[dict]:
+        try:
+            return self._google_calendar_request(
+                "GET",
+                f"/calendars/primary/events/{quote(meeting_id, safe='')}",
+            )
+        except Exception as e:
+            logger.warning(f"Google OAuth get event failed, falling back to gws: {e}")
+            return None
+
+    def _build_events_list_params(self, hours: int) -> dict:
+        now = datetime.now(self._local_timezone())
+        time_max = now + timedelta(hours=hours)
+        return {
+            "timeMin": self._as_rfc3339(now),
+            "timeMax": self._as_rfc3339(time_max),
+            "singleEvents": "true",
+            "orderBy": "startTime",
+        }
+
+    def _google_calendar_request(
+        self,
+        method: str,
+        path: str,
+        params: Optional[dict] = None,
+        json_body: Optional[dict] = None,
+    ) -> Optional[dict]:
+        access_token = self.google_auth_svc.get_valid_access_token()
+        if not access_token:
+            return None
+
+        response = requests.request(
+            method,
+            f"https://www.googleapis.com/calendar/v3{path}",
+            headers={"Authorization": f"Bearer {access_token}"},
+            params=params,
+            json=json_body,
+            timeout=20,
+        )
+        response.raise_for_status()
+        if not response.text:
+            return {}
+        return response.json()

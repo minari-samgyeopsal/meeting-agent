@@ -13,11 +13,15 @@
 - register_archive_entry: 채널 메시지를 카드 코멘트/체크리스트로 등록
 """
 
+import json
+import re
 from trello import TrelloClient
 from trello.board import Board
 from trello.card import Card
 from typing import Optional, List, Dict
-import re
+import requests
+
+from src.auth.trello_auth_service import TrelloAuthService
 from src.utils.config import Config
 from src.utils.logger import get_logger
 
@@ -28,24 +32,49 @@ class TrelloService:
     """Trello 카드 및 체크리스트 관리"""
     
     def __init__(self):
-        if (not Config.TRELLO_API_KEY or not Config.TRELLO_API_TOKEN) and not (Config.DRY_RUN or Config.DRY_RUN_TRELLO):
+        self.trello_auth_svc = TrelloAuthService()
+        self.oauth_token = self.trello_auth_svc.get_token() if self.trello_auth_svc.is_enabled() else None
+
+        if (
+            (not Config.TRELLO_API_KEY or not Config.TRELLO_API_TOKEN)
+            and not self.oauth_token
+            and not (Config.DRY_RUN or Config.DRY_RUN_TRELLO)
+        ):
             raise ValueError("TRELLO_API_KEY or TRELLO_API_TOKEN not set")
 
         self.client = None
-        if Config.TRELLO_API_KEY and Config.TRELLO_API_TOKEN:
+        if not self.oauth_token and Config.TRELLO_API_KEY and Config.TRELLO_API_TOKEN:
             self.client = TrelloClient(
                 api_key=Config.TRELLO_API_KEY,
                 token=Config.TRELLO_API_TOKEN,
             )
 
         self.board = None
-        if self.client:
+        self.board_name = ""
+        if self.oauth_token or self.client:
             self._init_board()
     
     def _init_board(self):
         """보드 초기화"""
         try:
+            if self.oauth_token:
+                board = self._trello_rest_request(
+                    "GET",
+                    f"/boards/{Config.TRELLO_BOARD_ID}",
+                    params={"fields": "id,name,url"},
+                )
+                if not board:
+                    return
+                self.board = _RestBoard(
+                    id=board.get("id", Config.TRELLO_BOARD_ID),
+                    name=board.get("name", "Trello Board"),
+                    url=board.get("url", ""),
+                )
+                self.board_name = self.board.name
+                logger.info(f"Trello board loaded via OAuth: {self.board.name}")
+                return
             self.board = self.client.get_board(Config.TRELLO_BOARD_ID)
+            self.board_name = self.board.name
             logger.info(f"Trello board loaded: {self.board.name}")
         except Exception as e:
             logger.error(f"Error loading Trello board: {e}")
@@ -62,6 +91,12 @@ class TrelloService:
         """
         try:
             if Config.DRY_RUN_TRELLO and not self.board:
+                return None
+
+            if self.oauth_token:
+                for card in self.list_cards_by_board_scope():
+                    if card.get("card_name") == company_name:
+                        return _RestCard(id=card.get("card_id", ""), name=card.get("card_name", ""), url=card.get("url", ""))
                 return None
 
             if not self.board:
@@ -95,6 +130,21 @@ class TrelloService:
             if Config.DRY_RUN or Config.DRY_RUN_TRELLO:
                 logger.info(f"[DRY RUN] Would create card: {company_name} in {list_name}")
                 return _DummyCard(company_name)
+
+            if self.oauth_token:
+                target_list_id = self._find_rest_list_id(list_name)
+                if not target_list_id:
+                    logger.error(f"List not found: {list_name}")
+                    return None
+                card = self._trello_rest_request(
+                    "POST",
+                    "/cards",
+                    params={"idList": target_list_id, "name": company_name},
+                )
+                if not card:
+                    return None
+                logger.info(f"Company card created via OAuth: {company_name} ({card.get('id', '')})")
+                return _RestCard(id=card.get("id", ""), name=card.get("name", company_name), url=card.get("url", ""))
             
             if not self.board:
                 logger.error("Trello board not initialized")
@@ -136,6 +186,9 @@ class TrelloService:
             if Config.DRY_RUN or Config.DRY_RUN_TRELLO:
                 logger.info(f"[DRY RUN] Would add checklist item: {title}")
                 return True
+
+            if isinstance(card, _RestCard):
+                return self._add_rest_checklist_item(card.id, "Action Items", title)
             
             # Checklist 찾기 또는 생성
             checklist = None
@@ -169,6 +222,36 @@ class TrelloService:
             컨텍스트 딕셔너리
         """
         try:
+            if isinstance(card, _RestCard):
+                checklists = self._trello_rest_request(
+                    "GET",
+                    f"/cards/{card.id}/checklists",
+                    params={"fields": "name", "checkItems": "all"},
+                ) or []
+                incomplete_items = []
+                for checklist in checklists:
+                    for item in checklist.get("checkItems", []):
+                        if item.get("state") != "complete":
+                            incomplete_items.append(item.get("name"))
+                comments_payload = self._trello_rest_request(
+                    "GET",
+                    f"/cards/{card.id}/actions",
+                    params={"filter": "commentCard", "limit": limit_comments},
+                ) or []
+                recent_comments = [
+                    {
+                        "author": (comment.get("memberCreator") or {}).get("fullName"),
+                        "text": (comment.get("data") or {}).get("text"),
+                    }
+                    for comment in comments_payload
+                ]
+                return {
+                    "card_name": card.name,
+                    "incomplete_items": incomplete_items,
+                    "recent_comments": recent_comments,
+                    "url": card.url,
+                }
+
             # 미완료 항목
             incomplete_items = []
             for checklist in card.checklists:
@@ -201,6 +284,21 @@ class TrelloService:
     def list_cards_by_board_scope(self, message: str = "", board_scope: Optional[str] = None) -> List[Dict]:
         """추천용 카드 목록 조회"""
         try:
+            if self.oauth_token:
+                cards = self._trello_rest_request(
+                    "GET",
+                    f"/boards/{Config.TRELLO_BOARD_ID}/cards",
+                    params={"fields": "id,name,url"},
+                ) or []
+                return [
+                    {
+                        "board": board_scope or self.board_name or "Trello Board",
+                        "card_id": card.get("id", ""),
+                        "card_name": card.get("name", ""),
+                        "url": card.get("url", ""),
+                    }
+                    for card in cards
+                ]
             if Config.DRY_RUN or Config.DRY_RUN_TRELLO or not self.board:
                 return self._dummy_card_candidates(message)
 
@@ -360,6 +458,16 @@ class TrelloService:
         ):
             return _DummyCard(card_name or "dry-run-card", url=card_url)
 
+        if self.oauth_token:
+            if card_id:
+                card = self._trello_rest_request("GET", f"/cards/{card_id}", params={"fields": "id,name,url"})
+                if card:
+                    return _RestCard(id=card.get("id", ""), name=card.get("name", ""), url=card.get("url", ""))
+            for card in self.list_cards_by_board_scope():
+                if card_name and card.get("card_name") == card_name:
+                    return _RestCard(id=card.get("card_id", ""), name=card.get("card_name", ""), url=card.get("url", ""))
+            return None
+
         if not self.board:
             return None
         for card in self.board.all_cards():
@@ -372,6 +480,13 @@ class TrelloService:
     def _add_comment_to_card(self, card, comment_text: str) -> None:
         if Config.DRY_RUN or Config.DRY_RUN_TRELLO:
             logger.info(f"[DRY RUN] Would add comment to {getattr(card, 'name', 'unknown')}")
+        if isinstance(card, _RestCard):
+            self._trello_rest_request(
+                "POST",
+                f"/cards/{card.id}/actions/comments",
+                params={"text": comment_text},
+            )
+            return
         if hasattr(card, "comment"):
             card.comment(comment_text)
             return
@@ -383,6 +498,9 @@ class TrelloService:
     def _add_checklist_item_with_name(self, card, checklist_name: str, title: str) -> None:
         if Config.DRY_RUN or Config.DRY_RUN_TRELLO:
             logger.info(f"[DRY RUN] Would add checklist item: {title}")
+        if isinstance(card, _RestCard):
+            self._add_rest_checklist_item(card.id, checklist_name, title)
+            return
         checklist = None
         for cl in getattr(card, "checklists", []):
             if getattr(cl, "name", "") == checklist_name:
@@ -425,6 +543,78 @@ class TrelloService:
         source = recommendation.get("card_name") or "Slack 아카이빙"
         timestamp = event_meta.get("event_ts", "")
         return f"⚡ 액션아이템 (출처: {source} {timestamp})".strip()
+
+    def _find_rest_list_id(self, list_name: str) -> Optional[str]:
+        lists = self._trello_rest_request(
+            "GET",
+            f"/boards/{Config.TRELLO_BOARD_ID}/lists",
+            params={"fields": "id,name"},
+        ) or []
+        for item in lists:
+            if item.get("name") == list_name:
+                return item.get("id")
+        return None
+
+    def _add_rest_checklist_item(self, card_id: str, checklist_name: str, title: str) -> bool:
+        checklists = self._trello_rest_request(
+            "GET",
+            f"/cards/{card_id}/checklists",
+            params={"fields": "name"},
+        ) or []
+        checklist_id = None
+        for checklist in checklists:
+            if checklist.get("name") == checklist_name:
+                checklist_id = checklist.get("id")
+                break
+        if not checklist_id:
+            created = self._trello_rest_request(
+                "POST",
+                f"/cards/{card_id}/checklists",
+                params={"name": checklist_name},
+            )
+            checklist_id = (created or {}).get("id")
+        if not checklist_id:
+            return False
+        self._trello_rest_request(
+            "POST",
+            f"/checklists/{checklist_id}/checkItems",
+            params={"name": title},
+        )
+        return True
+
+    def _trello_rest_request(self, method: str, path: str, params: Optional[dict] = None) -> Optional[dict]:
+        if not self.oauth_token:
+            return None
+        response = requests.request(
+            method,
+            f"https://api.trello.com/1{path}",
+            params={
+                "key": Config.TRELLO_OAUTH_APP_KEY or Config.TRELLO_API_KEY,
+                "token": self.oauth_token,
+                **(params or {}),
+            },
+            timeout=20,
+        )
+        response.raise_for_status()
+        if not response.text:
+            return {}
+        return response.json()
+
+
+class _RestBoard:
+    def __init__(self, id: str, name: str, url: str = ""):
+        self.id = id
+        self.name = name
+        self.url = url
+
+
+class _RestCard:
+    def __init__(self, id: str, name: str, url: str = ""):
+        self.id = id
+        self.name = name
+        self.url = url
+        self.checklists = []
+        self.comments = []
 
 
 class _DummyChecklist:

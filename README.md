@@ -162,6 +162,8 @@ python3 -m unittest tests.test_after_agent_unittest
 python3 -m unittest tests.test_calendar_service_unittest
 python3 -m unittest tests.test_channel_monitor_agent_unittest
 python3 -m unittest tests.test_cli_unittest tests.test_services_dry_run_unittest
+python3 -m unittest tests.test_google_auth_unittest
+python3 -m unittest tests.test_trello_auth_unittest
 ```
 
 ### 5. 채널 모니터 일일 배치
@@ -186,11 +188,71 @@ python3 -m src.cli channel-monitor-daily --channel C01234567 --send-channel D012
 - `CHANNEL_MONITOR_REVIEW_CHANNEL`
 - `ENABLE_CHANNEL_MONITOR_REALTIME=false`
 
+### 6. Google OAuth 연결
+
+현재는 Google OAuth 1차 전환으로 `CalendarService`가 OAuth 토큰이 있으면 Google REST를 우선 사용하고, 없으면 기존 `gws` 경로로 fallback 합니다.
+
+상태 확인:
+
+```bash
+python3 -m src.cli google-oauth-status
+```
+
+로그인 URL 출력:
+
+```bash
+python3 -m src.cli google-oauth-url
+```
+
+로컬 callback 기반 로그인:
+
+```bash
+python3 -m src.cli google-oauth-login
+```
+
+현재 OAuth 우선 경로가 붙은 범위:
+- 향후 미팅 조회
+- 미팅 생성
+- 참석자 추가
+- 어젠다/설명 업데이트
+- Gmail 메시지 검색
+- Drive 텍스트 파일 read/write
+
+### 7. Trello OAuth 연결
+
+현재는 Trello 1차 전환으로 `TrelloService`가 OAuth 승인 토큰이 있으면 Trello REST를 우선 사용하고, 없으면 기존 `.env`의 `TRELLO_API_KEY / TRELLO_API_TOKEN` 경로로 fallback 합니다.
+
+상태 확인:
+
+```bash
+python3 -m src.cli trello-oauth-status
+```
+
+승인 URL 출력:
+
+```bash
+python3 -m src.cli trello-oauth-url
+```
+
+사용자 token 저장:
+
+```bash
+python3 -m src.cli trello-oauth-connect --token <trello_user_token>
+```
+
+현재 OAuth 우선 경로가 붙은 범위:
+- 보드 카드 목록 조회
+- 카드 조회
+- 카드 코멘트 추가
+- 체크리스트/체크아이템 추가
+- 신규 카드 생성
+
 ## 운영/설계 문서
 
 - [요구사항 문서](/Users/minhwankim/workspace/260325_Clade_Meetagain/docs/meeting-agent-requirements-v2_3.md)
 - [구현 현황](/Users/minhwankim/workspace/260325_Clade_Meetagain/docs/implementation_status.md)
 - [LLM 사용 정리](/Users/minhwankim/workspace/260325_Clade_Meetagain/docs/llm_usage.md)
+- [OAuth 전환 설계](/Users/minhwankim/workspace/260325_Clade_Meetagain/docs/oauth_migration_plan.md)
 - [제출 문서](/Users/minhwankim/workspace/260325_Clade_Meetagain/SUBMISSION.md)
 
 ## 현재 상태

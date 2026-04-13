@@ -155,6 +155,14 @@ class CalendarServiceUnitTest(unittest.TestCase):
             Config.DRY_RUN = original
             Config.DRY_RUN_CALENDAR = original_calendar
 
+    def test_looks_external_meeting_uses_company_name_in_title_when_attendees_missing(self):
+        service = CalendarService()
+
+        self.assertTrue(service._looks_external_meeting("삼성전자 POC 제안 미팅", []))
+        self.assertTrue(service._looks_external_meeting("LG전자 미팅", []))
+        self.assertFalse(service._looks_external_meeting("슈퍼사이클 BIZ 미팅", ["cwkwak@parametacorp.com"]))
+        self.assertFalse(service._looks_external_meeting("집", []))
+
 
 if __name__ == "__main__":
     unittest.main()

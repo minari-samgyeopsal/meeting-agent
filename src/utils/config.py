@@ -24,6 +24,23 @@ class Config:
     )
     GWS_BIN = os.getenv("GWS_BIN", shutil.which("gws") or "/Users/minhwankim/.npm-global/bin/gws")
     GWS_DOMAIN = os.getenv("GWS_DOMAIN", "parametacorp.com")
+    ENABLE_GOOGLE_OAUTH = os.getenv("ENABLE_GOOGLE_OAUTH", "false").lower() == "true"
+    GOOGLE_OAUTH_CLIENT_ID = os.getenv("GOOGLE_OAUTH_CLIENT_ID", "")
+    GOOGLE_OAUTH_CLIENT_SECRET = os.getenv("GOOGLE_OAUTH_CLIENT_SECRET", "")
+    GOOGLE_OAUTH_REDIRECT_URI = os.getenv(
+        "GOOGLE_OAUTH_REDIRECT_URI",
+        "http://127.0.0.1:8787/oauth/google/callback",
+    )
+    GOOGLE_OAUTH_OWNER = os.getenv("GOOGLE_OAUTH_OWNER", "default")
+    GOOGLE_OAUTH_SCOPES = [
+        item.strip()
+        for item in os.getenv(
+            "GOOGLE_OAUTH_SCOPES",
+            "openid,email,https://www.googleapis.com/auth/calendar,https://www.googleapis.com/auth/gmail.readonly,https://www.googleapis.com/auth/drive.file",
+        ).split(",")
+        if item.strip()
+    ]
+    OAUTH_TOKEN_STORE_PATH = os.getenv("OAUTH_TOKEN_STORE_PATH", "./cache/oauth_tokens.json")
     
     # ============ Slack ============
     SLACK_BOT_TOKEN = os.getenv("SLACK_BOT_TOKEN", "")
@@ -39,6 +56,13 @@ class Config:
     TRELLO_API_KEY = os.getenv("TRELLO_API_KEY", "")
     TRELLO_API_TOKEN = os.getenv("TRELLO_API_TOKEN", "")
     TRELLO_BOARD_ID = os.getenv("TRELLO_BOARD_ID", "69731ce5")
+    ENABLE_TRELLO_OAUTH = os.getenv("ENABLE_TRELLO_OAUTH", "false").lower() == "true"
+    TRELLO_OAUTH_APP_KEY = os.getenv("TRELLO_OAUTH_APP_KEY", os.getenv("TRELLO_API_KEY", ""))
+    TRELLO_OAUTH_OWNER = os.getenv("TRELLO_OAUTH_OWNER", "default")
+    TRELLO_OAUTH_APP_NAME = os.getenv("TRELLO_OAUTH_APP_NAME", "Meetagain")
+    TRELLO_OAUTH_SCOPE = os.getenv("TRELLO_OAUTH_SCOPE", "read,write")
+    TRELLO_OAUTH_EXPIRATION = os.getenv("TRELLO_OAUTH_EXPIRATION", "never")
+    TRELLO_OAUTH_RETURN_URL = os.getenv("TRELLO_OAUTH_RETURN_URL", "https://localhost/trello/oauth")
     
     # ============ Web Search ============
     SEARCH_RESULTS_COUNT = int(os.getenv("SEARCH_RESULTS_COUNT", "5"))
@@ -86,6 +110,17 @@ class Config:
     @classmethod
     def validate(cls, required_names=None) -> bool:
         """필수 설정 값 검증"""
+        trello_oauth_connected = False
+        if cls.ENABLE_TRELLO_OAUTH and cls.TRELLO_OAUTH_APP_KEY:
+            try:
+                from src.auth.token_store import TokenStore
+
+                trello_oauth_connected = bool(
+                    (TokenStore(cls.OAUTH_TOKEN_STORE_PATH).get_token("trello", cls.TRELLO_OAUTH_OWNER) or {}).get("token")
+                )
+            except Exception:
+                trello_oauth_connected = False
+
         value_map = {
             "SLACK_BOT_TOKEN": cls.SLACK_BOT_TOKEN,
             "SLACK_SIGNING_SECRET": cls.SLACK_SIGNING_SECRET,
@@ -116,6 +151,8 @@ class Config:
         missing = []
         for name in required_names:
             if cls.DRY_RUN and name in optional_in_dry_run:
+                continue
+            if name in {"TRELLO_API_KEY", "TRELLO_API_TOKEN"} and trello_oauth_connected:
                 continue
             if not value_map.get(name):
                 missing.append(name)

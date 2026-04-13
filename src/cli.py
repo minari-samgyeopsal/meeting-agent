@@ -17,11 +17,14 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Optional
 
+from src.auth.google_auth_service import GoogleAuthService
+from src.auth.trello_auth_service import TrelloAuthService
 from src.agents.before_agent import BeforeAgent
 from src.agents.during_agent import DuringAgent
 from src.agents.after_agent import AfterAgent
 from src.agents.channel_monitor_agent import ChannelMonitorAgent
 from src.services.slack_service import SlackService
+from src.services.trello_service import TrelloService
 from src.utils.config import Config
 from src.utils.meeting_state import get_follow_up_needed, resolve_auto_rerun_stage
 from src.utils.status_formatter import format_meeting_status
@@ -351,6 +354,63 @@ async def main():
         help="리뷰 큐를 보낼 Slack 채널/DM 채널 ID. 미지정 시 CHANNEL_MONITOR_REVIEW_CHANNEL 사용",
     )
 
+    google_oauth_status_parser = subparsers.add_parser(
+        "google-oauth-status",
+        help="Google OAuth 연결 상태 확인",
+    )
+    google_oauth_status_parser.add_argument("--owner", help="토큰 owner id")
+    google_oauth_status_parser.add_argument("--json", action="store_true", help="JSON으로 출력")
+
+    google_oauth_url_parser = subparsers.add_parser(
+        "google-oauth-url",
+        help="Google OAuth 로그인 URL 출력",
+    )
+    google_oauth_url_parser.add_argument("--owner", help="토큰 owner id")
+
+    google_oauth_login_parser = subparsers.add_parser(
+        "google-oauth-login",
+        help="로컬 callback 기반 Google OAuth 로그인",
+    )
+    google_oauth_login_parser.add_argument("--owner", help="토큰 owner id")
+    google_oauth_login_parser.add_argument(
+        "--no-browser",
+        action="store_true",
+        help="브라우저 자동 열기 없이 URL만 출력",
+    )
+    google_oauth_login_parser.add_argument(
+        "--timeout",
+        type=int,
+        default=180,
+        help="callback 대기 시간(초)",
+    )
+
+    google_oauth_connect_parser = subparsers.add_parser(
+        "google-oauth-connect",
+        help="Google OAuth authorization code를 토큰으로 교환",
+    )
+    google_oauth_connect_parser.add_argument("--code", required=True, help="OAuth callback code")
+    google_oauth_connect_parser.add_argument("--owner", help="토큰 owner id")
+
+    trello_oauth_status_parser = subparsers.add_parser(
+        "trello-oauth-status",
+        help="Trello OAuth 연결 상태 확인",
+    )
+    trello_oauth_status_parser.add_argument("--owner", help="토큰 owner id")
+    trello_oauth_status_parser.add_argument("--json", action="store_true", help="JSON으로 출력")
+
+    trello_oauth_url_parser = subparsers.add_parser(
+        "trello-oauth-url",
+        help="Trello 승인 URL 출력",
+    )
+    trello_oauth_url_parser.add_argument("--owner", help="토큰 owner id")
+
+    trello_oauth_connect_parser = subparsers.add_parser(
+        "trello-oauth-connect",
+        help="Trello 승인 토큰 저장",
+    )
+    trello_oauth_connect_parser.add_argument("--token", required=True, help="Trello user token")
+    trello_oauth_connect_parser.add_argument("--owner", help="토큰 owner id")
+
     rerun_parser = subparsers.add_parser("rerun", help="meeting_id 기준 단계 재실행")
     rerun_parser.add_argument("--meeting-id", required=True, help="Calendar event ID")
     rerun_parser.add_argument(
@@ -417,6 +477,67 @@ async def main():
                 send_dm_email=send_dm_email,
             )
             print(delivery)
+        raise SystemExit(0)
+
+    if args.command == "google-oauth-status":
+        auth = GoogleAuthService(owner_id=getattr(args, "owner", None))
+        status = auth.get_status()
+        if args.json:
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+        else:
+            print(_render_google_oauth_status(status))
+        raise SystemExit(0)
+
+    if args.command == "google-oauth-url":
+        auth = GoogleAuthService(owner_id=getattr(args, "owner", None))
+        if not auth.is_configured():
+            print("Google OAuth 설정이 없습니다. GOOGLE_OAUTH_CLIENT_ID / SECRET / REDIRECT_URI를 확인하세요.")
+            raise SystemExit(1)
+        print(auth.build_authorization_url())
+        raise SystemExit(0)
+
+    if args.command == "google-oauth-login":
+        auth = GoogleAuthService(owner_id=getattr(args, "owner", None))
+        if not auth.is_configured():
+            print("Google OAuth 설정이 없습니다. GOOGLE_OAUTH_CLIENT_ID / SECRET / REDIRECT_URI를 확인하세요.")
+            raise SystemExit(1)
+        result = auth.run_local_login(open_browser=not args.no_browser, timeout=args.timeout)
+        print(_render_google_oauth_login_result(result))
+        raise SystemExit(0)
+
+    if args.command == "google-oauth-connect":
+        auth = GoogleAuthService(owner_id=getattr(args, "owner", None))
+        if not auth.is_configured():
+            print("Google OAuth 설정이 없습니다. GOOGLE_OAUTH_CLIENT_ID / SECRET / REDIRECT_URI를 확인하세요.")
+            raise SystemExit(1)
+        record = auth.exchange_code_for_token(args.code)
+        print(_render_google_oauth_login_result({"ok": True, "owner_id": auth.owner_id, "expires_at": record.get("expires_at"), "email": (record.get("metadata") or {}).get("email")}))
+        raise SystemExit(0)
+
+    if args.command == "trello-oauth-status":
+        auth = TrelloAuthService(owner_id=getattr(args, "owner", None))
+        status = auth.get_status()
+        if args.json:
+            print(json.dumps(status, ensure_ascii=False, indent=2))
+        else:
+            print(_render_trello_oauth_status(status))
+        raise SystemExit(0)
+
+    if args.command == "trello-oauth-url":
+        auth = TrelloAuthService(owner_id=getattr(args, "owner", None))
+        if not auth.is_configured():
+            print("Trello OAuth 설정이 없습니다. TRELLO_OAUTH_APP_KEY를 확인하세요.")
+            raise SystemExit(1)
+        print(auth.build_authorization_url())
+        raise SystemExit(0)
+
+    if args.command == "trello-oauth-connect":
+        auth = TrelloAuthService(owner_id=getattr(args, "owner", None))
+        if not auth.is_configured():
+            print("Trello OAuth 설정이 없습니다. TRELLO_OAUTH_APP_KEY를 확인하세요.")
+            raise SystemExit(1)
+        record = auth.connect_token(args.token)
+        print(_render_trello_oauth_connect_result(record, auth.owner_id))
         raise SystemExit(0)
 
     if args.command == "pipeline":
@@ -722,6 +843,59 @@ def _render_channel_monitor_daily_report(report: dict) -> str:
                 f"{item.get('headline', '')} | reasons={', '.join(item.get('reasons', []))}"
             )
     return "\n".join(lines)
+
+
+def _render_google_oauth_status(status: dict) -> str:
+    return "\n".join(
+        [
+            "Google OAuth 상태",
+            f"- enabled: {status.get('enabled', False)}",
+            f"- configured: {status.get('configured', False)}",
+            f"- connected: {status.get('connected', False)}",
+            f"- owner_id: {status.get('owner_id', 'default')}",
+            f"- email: {status.get('email') or 'unknown'}",
+            f"- expires_at: {status.get('expires_at') or 'not connected'}",
+            f"- scopes: {', '.join(status.get('scopes', [])) or 'none'}",
+        ]
+    )
+
+
+def _render_google_oauth_login_result(result: dict) -> str:
+    return "\n".join(
+        [
+            "Google OAuth 연결 완료",
+            f"- owner_id: {result.get('owner_id', 'default')}",
+            f"- email: {result.get('email') or 'unknown'}",
+            f"- expires_at: {result.get('expires_at') or 'unknown'}",
+        ]
+    )
+
+
+def _render_trello_oauth_status(status: dict) -> str:
+    return "\n".join(
+        [
+            "Trello OAuth 상태",
+            f"- enabled: {status.get('enabled', False)}",
+            f"- configured: {status.get('configured', False)}",
+            f"- connected: {status.get('connected', False)}",
+            f"- owner_id: {status.get('owner_id', 'default')}",
+            f"- member_username: {status.get('member_username') or 'unknown'}",
+            f"- member_full_name: {status.get('member_full_name') or 'unknown'}",
+            f"- scopes: {', '.join(status.get('scopes', [])) or 'none'}",
+        ]
+    )
+
+
+def _render_trello_oauth_connect_result(record: dict, owner_id: str) -> str:
+    return "\n".join(
+        [
+            "Trello OAuth 연결 완료",
+            f"- owner_id: {owner_id}",
+            f"- member_username: {record.get('member_username') or 'unknown'}",
+            f"- member_full_name: {record.get('member_full_name') or 'unknown'}",
+            f"- scopes: {', '.join(record.get('scope', [])) or 'none'}",
+        ]
+    )
 
 
 def _send_channel_monitor_review_queue(
@@ -1158,6 +1332,7 @@ def _build_doctor_report(
         "TRELLO_API_TOKEN": bool(Config.TRELLO_API_TOKEN),
         "GWS_CRED_FILE": bool(Config.GWS_CRED_FILE and Config.GWS_CRED_FILE != "/path/to/credentials.json"),
     }
+    trello_connected = _probe_trello_connection()
     live_checks = {
         "slack_ready": all(
             [
@@ -1167,6 +1342,7 @@ def _build_doctor_report(
             ]
         ),
         "trello_ready": env["TRELLO_API_KEY"] and env["TRELLO_API_TOKEN"],
+        "trello_connected": trello_connected,
         "anthropic_ready": env["ANTHROPIC_API_KEY"],
         "gws_ready": env["GWS_CRED_FILE"],
         "gws_cli_ready": bool(shutil.which("gws")) or Path(Config.gws_bin()).exists(),
@@ -1177,6 +1353,7 @@ def _build_doctor_report(
         [
             live_checks["slack_ready"],
             live_checks["trello_ready"],
+            live_checks["trello_connected"] if live_checks["trello_live"] else True,
             live_checks["anthropic_ready"],
             live_checks["gws_ready"],
             live_checks["gws_cli_ready"],
@@ -1185,7 +1362,13 @@ def _build_doctor_report(
     latest = dashboard_entries[0] if dashboard_entries else {}
     recommendations = []
     if not Config.DRY_RUN:
-        recommendations.append("실연동 환경 점검으로 전환하세요.")
+        if live_checks["core_live_ready"]:
+            recommendations.append("실연동 환경 점검으로 전환하세요.")
+        else:
+            if live_checks["trello_live"] and not live_checks["trello_connected"]:
+                recommendations.append("Trello live 연결이 실패합니다. API 토큰보다 TLS/인증서 환경을 먼저 점검하세요.")
+            if not live_checks["gws_cli_ready"]:
+                recommendations.append("gws CLI 경로 또는 인증 상태를 먼저 점검하세요.")
     else:
         if not live_checks["core_live_ready"]:
             recommendations.append("python3 -m src.cli doctor 로 live 전환 필수 env 값을 먼저 확인하세요.")
@@ -1229,6 +1412,17 @@ def _build_doctor_report(
         },
         "recommendations": recommendations,
     }
+
+
+def _probe_trello_connection() -> bool:
+    if Config.DRY_RUN_TRELLO:
+        return True
+    if not (Config.TRELLO_API_KEY and Config.TRELLO_API_TOKEN):
+        return False
+    try:
+        return bool(TrelloService().board)
+    except Exception:
+        return False
 
 
 def _build_ops_export_command(
@@ -1417,6 +1611,7 @@ def _render_doctor_report(report: dict, as_json: bool = False) -> str:
         "## Live Readiness",
         f"- slack_ready: {report.get('live_checks', {}).get('slack_ready', False)}",
         f"- trello_ready: {report.get('live_checks', {}).get('trello_ready', False)}",
+        f"- trello_connected: {report.get('live_checks', {}).get('trello_connected', False)}",
         f"- anthropic_ready: {report.get('live_checks', {}).get('anthropic_ready', False)}",
         f"- gws_ready: {report.get('live_checks', {}).get('gws_ready', False)}",
         f"- gws_cli_ready: {report.get('live_checks', {}).get('gws_cli_ready', False)}",

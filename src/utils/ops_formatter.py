@@ -127,6 +127,7 @@ def format_doctor_summary(report: dict) -> str:
         f"- Trello live: {live_checks.get('trello_live', False)}",
         f"- Slack 준비: {live_checks.get('slack_ready', False)}",
         f"- Trello 준비: {live_checks.get('trello_ready', False)}",
+        f"- Trello 연결: {live_checks.get('trello_connected', False)}",
         f"- Anthropic 준비: {live_checks.get('anthropic_ready', False)}",
         f"- gws CLI 준비: {live_checks.get('gws_cli_ready', False)}",
         f"- Live 핵심 준비: {live_checks.get('core_live_ready', False)}",

@@ -33,3 +33,4 @@ mypy>=1.4.0
 
 # Optional: async support
 httpx>=0.24.0
+requests>=2.31.0
